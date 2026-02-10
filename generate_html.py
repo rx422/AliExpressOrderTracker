@@ -48,40 +48,93 @@ class Order:
     price: float
     local_image: str
     is_archived: bool = False
+    is_usd: bool = False
 
 
 # =============================================================================
 # Exchange Rate
 # =============================================================================
 
-def get_usd_to_eur_rate() -> float:
-    """Fetch current USD to EUR exchange rate with caching."""
+def load_rate_cache() -> dict:
+    """Load exchange rate cache from disk."""
+    try:
+        with open(EXCHANGE_RATE_CACHE, 'r') as f:
+            data = json.load(f)
+            # Migrate old format {"rate": X} to new format
+            if 'rate' in data and 'current' not in data:
+                return {'current': data['rate'], 'historical': {}}
+            return data
+    except:
+        return {'current': None, 'historical': {}}
+
+
+def save_rate_cache(cache: dict):
+    """Save exchange rate cache to disk."""
+    with open(EXCHANGE_RATE_CACHE, 'w') as f:
+        json.dump(cache, f)
+
+
+def get_current_rate(cache: dict) -> float:
+    """Fetch current USD to EUR exchange rate."""
     try:
         url = 'https://api.exchangerate-api.com/v4/latest/USD'
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, timeout=5) as response:
             data = json.loads(response.read().decode())
             rate = data['rates']['EUR']
-            
-            # Cache the rate
-            with open(EXCHANGE_RATE_CACHE, 'w') as f:
-                json.dump({'rate': rate}, f)
-            
-            print(f"USD to EUR rate: {rate} (live)")
+            cache['current'] = rate
+            print(f"Current USD/EUR rate: {rate} (live)")
             return rate
     except Exception as e:
-        print(f"Could not fetch exchange rate: {e}")
-        
-        # Try cached rate
-        try:
-            with open(EXCHANGE_RATE_CACHE, 'r') as f:
-                cached = json.load(f)
-                rate = cached['rate']
-                print(f"USD to EUR rate: {rate} (cached)")
-                return rate
-        except:
-            print(f"USD to EUR rate: {DEFAULT_EXCHANGE_RATE} (default)")
-            return DEFAULT_EXCHANGE_RATE
+        print(f"Could not fetch current rate: {e}")
+        if cache.get('current'):
+            print(f"Current USD/EUR rate: {cache['current']} (cached)")
+            return cache['current']
+        print(f"Current USD/EUR rate: {DEFAULT_EXCHANGE_RATE} (default)")
+        return DEFAULT_EXCHANGE_RATE
+
+
+def fetch_historical_rates(dates: set, cache: dict) -> dict:
+    """Fetch historical USD→EUR rates for given dates via frankfurter API."""
+    historical = cache.setdefault('historical', {})
+    missing = sorted(d for d in dates if d not in historical)
+    if not missing:
+        return historical
+
+    min_date, max_date = missing[0], missing[-1]
+    try:
+        url = f'https://api.frankfurter.app/{min_date}..{max_date}?from=USD&to=EUR'
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=15) as response:
+            data = json.loads(response.read().decode())
+            for date_str, rates in data.get('rates', {}).items():
+                historical[date_str] = rates['EUR']
+        print(f"Fetched historical rates: {min_date} to {max_date} ({len(missing)} dates)")
+    except Exception as e:
+        print(f"Could not fetch historical rates: {e}")
+
+    return historical
+
+
+def get_rate_for_date(date_str: str, historical: dict, current_rate: float) -> float:
+    """Get USD→EUR rate for a specific date, finding nearest if exact not available."""
+    if not date_str:
+        return current_rate
+    if date_str in historical:
+        return historical[date_str]
+    # Find nearest available date (weekends/holidays fall back to closest business day)
+    available = sorted(historical.keys())
+    if not available:
+        return current_rate
+    # Binary search for nearest date
+    import bisect
+    idx = bisect.bisect_left(available, date_str)
+    if idx == 0:
+        return historical[available[0]]
+    if idx >= len(available):
+        return historical[available[-1]]
+    before, after = available[idx - 1], available[idx]
+    return historical[before]  # Use the rate from before (conservative)
 
 
 # =============================================================================
@@ -109,23 +162,20 @@ def find_source_files(directory: Path):
 # Order Parsing
 # =============================================================================
 
-def parse_price(price_str: str, usd_to_eur: float) -> float:
-    """Parse price string and convert to EUR if needed."""
+def parse_price(price_str: str) -> tuple:
+    """Parse price string, return (amount, is_usd)."""
     is_usd = '$' in price_str
     price_num = re.sub(r'[$€\s]', '', price_str).replace(',', '.')
     try:
-        price = float(price_num)
-        if is_usd:
-            price = round(price * usd_to_eur, 2)
-        return price
+        return float(price_num), is_usd
     except:
-        return 0.0
+        return 0.0, False
 
 
 def parse_delivery_date(delivery_info: str) -> str:
     """Extract delivery date from delivery info string."""
     date_match = re.search(
-        r'(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)',
+        r'(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)(?:\s+(\d{4}))?',
         delivery_info, re.IGNORECASE
     )
     if date_match:
@@ -137,12 +187,12 @@ def parse_delivery_date(delivery_info: str) -> str:
             'September': 9, 'October': 10, 'November': 11, 'December': 12
         }
         month = months.get(month_name, 1)
-        year = 2026 if month >= 1 else 2025
+        year = int(date_match.group(3)) if date_match.group(3) else 2026
         return f'{year}-{month:02d}-{day:02d}'
     return ''
 
 
-def parse_orders(html_content: str, usd_to_eur: float, is_archived: bool = False) -> List[Order]:
+def parse_orders(html_content: str, is_archived: bool = False) -> List[Order]:
     """Parse orders from AliExpress HTML content."""
     order_blocks = re.split(r'RedOrderList_OrderList__item__a2315', html_content)
     orders = []
@@ -160,21 +210,26 @@ def parse_orders(html_content: str, usd_to_eur: float, is_archived: bool = False
         # Status
         status_match = re.search(r'RedOrderList_OrderItem__tag__1tjf5[^"]*">([^<]+)</div>', block)
         status = status_match.group(1).strip() if status_match else "Unknown"
-        
+
         # Delivery info
         delivery_match = re.search(r'RedOrderList_OrderItem__title__1tjf5">([^<]+)</h4>', block)
         delivery_info = delivery_match.group(1).strip() if delivery_match else "N/A"
-        
+
         # Description
         desc_match = re.search(r'RedOrderList_OrderItem__description__1tjf5[^"]*">([^<]+)</div>', block)
         description = desc_match.group(1).strip() if desc_match else ""
-        
+
+        # Skip cancelled/expired orders (check status, delivery info, and description)
+        combined = f'{status} {delivery_info} {description}'.upper()
+        if 'CANCELLED' in combined or 'CANCELED' in combined or 'TIME FOR PAYMENT' in combined:
+            continue
+
         # Check if delayed
         is_delayed = 'descriptionDangerous' in block and bool(description)
         
         # Price
         price_match = re.search(r'totalPrice__1tjf5">([^<]+)</div>', block)
-        price = parse_price(price_match.group(1), usd_to_eur) if price_match else 0.0
+        price, is_usd = parse_price(price_match.group(1)) if price_match else (0.0, False)
         
         # Image
         image_match = re.search(r'src="[^"]*_files/([^"]+\.jpg)"', block)
@@ -193,6 +248,7 @@ def parse_orders(html_content: str, usd_to_eur: float, is_archived: bool = False
             price=price,
             local_image=local_image,
             is_archived=is_archived,
+            is_usd=is_usd,
         ))
     
     return orders
@@ -310,7 +366,7 @@ def generate_html(orders: List[Order], images_map: dict) -> str:
 # Main
 # =============================================================================
 
-def load_orders_from_dir(directory: Path, usd_to_eur: float, is_archived: bool = False):
+def load_orders_from_dir(directory: Path, is_archived: bool = False):
     """Load and parse orders from a directory containing a saved AliExpress HTML."""
     html_file, images_folder = find_source_files(directory)
     if not html_file:
@@ -321,25 +377,45 @@ def load_orders_from_dir(directory: Path, usd_to_eur: float, is_archived: bool =
     with open(html_file, 'r', encoding='utf-8') as f:
         html_content = f.read()
 
-    orders = parse_orders(html_content, usd_to_eur, is_archived=is_archived)
+    orders = parse_orders(html_content, is_archived=is_archived)
     label = 'archive' if is_archived else 'active'
     print(f"Found {len(orders)} orders in {label}/ ({html_file.name})")
     return orders, images_folder
 
 
+def convert_usd_prices(orders: List[Order], current_rate: float, historical: dict):
+    """Convert USD prices to EUR using date-appropriate exchange rates."""
+    for order in orders:
+        if not order.is_usd:
+            continue
+        rate = get_rate_for_date(order.delivery_date, historical, current_rate)
+        order.price = round(order.price * rate, 2)
+
+
 def main():
     """Main entry point."""
-    # Get exchange rate
-    usd_to_eur = get_usd_to_eur_rate()
+    # Load rate cache
+    cache = load_rate_cache()
+    current_rate = get_current_rate(cache)
 
     # Load orders from active and archive folders
-    active_orders, active_images = load_orders_from_dir(ACTIVE_DIR, usd_to_eur)
-    archive_orders, archive_images = load_orders_from_dir(ARCHIVE_DIR, usd_to_eur, is_archived=True)
+    active_orders, active_images = load_orders_from_dir(ACTIVE_DIR)
+    archive_orders, archive_images = load_orders_from_dir(ARCHIVE_DIR, is_archived=True)
 
     all_orders = active_orders + archive_orders
     if not all_orders:
         print("No orders found in active/ or archive/ folders.")
         return
+
+    # Fetch historical rates for USD orders that have dates
+    usd_dates = {o.delivery_date for o in all_orders if o.is_usd and o.delivery_date}
+    historical = fetch_historical_rates(usd_dates, cache) if usd_dates else {}
+
+    # Convert USD prices using date-specific rates
+    convert_usd_prices(all_orders, current_rate, historical)
+
+    # Save updated cache
+    save_rate_cache(cache)
 
     # Build images lookup: map each order to its images folder
     images_map = {}

@@ -27,7 +27,7 @@ A simple tool to extract and track your AliExpress orders from saved HTML pages,
 ### Step 2: Run the Script
 
 ```powershell
-.\.venv\Scripts\python.exe generate_html.py
+python generate_html.py
 ```
 
 The script auto-detects the HTML file and `_files` folder in each directory.
